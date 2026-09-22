@@ -74,6 +74,84 @@ function setLoading(isLoading) {
 }
 
 
+/**
+ * Normalizes characters that Word's AutoCorrect/AutoFormat commonly
+ * substitutes (smart quotes, en/em dashes, non-breaking spaces) so the
+ * regex-based parsers downstream see predictable, literal characters.
+ * Run this on every piece of text pulled out of the document BEFORE
+ * it hits parseCitationText / KNOWN_STYLE_PATTERNS.
+ */
+function sanitizeText(text) {
+    return text
+        .replace(/[\u2018\u2019\u201B]/g, "'")   // smart single quotes -> '
+        .replace(/[\u201C\u201D\u201F]/g, '"')   // smart double quotes -> "
+        .replace(/[\u2013\u2014]/g, "-")          // en/em dash -> hyphen
+        .replace(/\u00A0/g, " ")                  // non-breaking space -> space
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
+
+/**
+ * A line is treated as the START of a new reference entry if it looks
+ * like a numbered marker ("[1]", "1.", "1)") or begins with an
+ * "Lastname, F." author pattern. Any other non-blank line is assumed
+ * to be a wrapped continuation of the reference currently being built.
+ * A blank line always closes out the current reference.
+ */
+const REFERENCE_START_PATTERN =
+    /^(?:\[\d+\]|\d+[.)])\s*\S|^[A-Z][a-zA-Z'-]+,\s*[A-Z]\.(?:\s*[A-Z]\.)?/;
+
+
+/**
+ * Groups the raw selected text into one string per reference entry,
+ * instead of naively treating every line break as a new entry. This
+ * correctly re-joins references that wrap across multiple lines
+ * (very common when pasted/typed with hanging-indent formatting).
+ */
+function splitIntoReferenceBlocks(text) {
+
+    const normalized = text.replace(/[\r\v]+/g, "\n");
+
+    const lines = normalized.split("\n");
+
+    const blocks = [];
+    let current = "";
+
+    for (const rawLine of lines) {
+
+        const trimmed = rawLine.trim();
+
+        if (trimmed.length === 0) {
+            if (current) {
+                blocks.push(current.trim());
+                current = "";
+            }
+            continue;
+        }
+
+        const startsNewReference =
+            current.length === 0 ||
+            REFERENCE_START_PATTERN.test(trimmed);
+
+        if (startsNewReference && current.length > 0) {
+            blocks.push(current.trim());
+            current = trimmed;
+        } else {
+            current = current
+                ? `${current} ${trimmed}`
+                : trimmed;
+        }
+    }
+
+    if (current) {
+        blocks.push(current.trim());
+    }
+
+    return blocks.filter((b) => b.length > 0);
+}
+
+
 async function formatSelection() {
     setLoading(true);
 
@@ -87,10 +165,9 @@ async function formatSelection() {
             await context.sync();
 
 
-            const rawLines = selection.text
-                .split(/[\r\v\n]+/)
-                .map((line) => line.trim())
-                .filter((line) => line.length > 0);
+            const rawLines = splitIntoReferenceBlocks(selection.text)
+                .map((block) => sanitizeText(block))
+                .filter((block) => block.length > 0);
 
 
             if (rawLines.length === 0) {
@@ -190,6 +267,77 @@ async function formatSelection() {
 
 
 /**
+ * Pulls every "LastName, X." author out of a parsed author string,
+ * in original order. Falls back to a single guessed last name if the
+ * string doesn't match the usual "Last, F." pattern (e.g. already a
+ * bare name, or an unusual format).
+ */
+function extractLastNames(authorStr) {
+
+    const matches =
+        [...authorStr.matchAll(/([A-Z][a-zA-Z'-]+),\s*[A-Z]\.(?:\s*[A-Z]\.)?/g)];
+
+    if (matches.length > 0) {
+        return matches.map((m) => m[1]);
+    }
+
+    const fallback = authorStr.split(",")[0].trim();
+
+    return fallback ? [fallback] : ["Author"];
+}
+
+
+/**
+ * Builds the "best" in-text author form used when WRITING a new
+ * citation marker (Chicago/MLA/APA/Harvard): "Smith" / "Johnson & Lee"
+ * / "Brown et al." — the conventional short form for 3+ authors.
+ */
+function inTextAuthorForm(authorStr) {
+
+    const names = extractLastNames(authorStr);
+
+    if (names.length === 1) {
+        return names[0];
+    }
+
+    if (names.length === 2) {
+        return `${names[0]} & ${names[1]}`;
+    }
+
+    return `${names[0]} et al.`;
+}
+
+
+/**
+ * Builds every plausible in-text author form used when SEARCHING the
+ * document for an existing citation to replace. Some reference styles
+ * (e.g. APA 6th) spell out all authors up to five on first mention
+ * instead of using "et al." right away, so for 3+ authors this returns
+ * BOTH the short "et al." form and the full spelled-out list, so
+ * either convention found in the document text gets matched.
+ */
+function inTextAuthorForms(authorStr) {
+
+    const names = extractLastNames(authorStr);
+
+    if (names.length === 1) {
+        return [names[0]];
+    }
+
+    if (names.length === 2) {
+        return [`${names[0]} & ${names[1]}`];
+    }
+
+    const fullList =
+        `${names.slice(0, -1).join(", ")}, & ${names[names.length - 1]}`;
+
+    const etAl = `${names[0]} et al.`;
+
+    return [etAl, fullList];
+}
+
+
+/**
  * Best-effort in-text citation sync.
  *
  * There is no persistent link between a reference-list entry and
@@ -207,10 +355,8 @@ async function syncInlineCitations(context, ref) {
     } = ref;
 
 
-    const lastName =
-        parsedData.author
-            .split(",")[0]
-            .trim();
+    const authorForms =
+        inTextAuthorForms(parsedData.author);
 
 
     const newMarker =
@@ -225,15 +371,17 @@ async function syncInlineCitations(context, ref) {
 
         `[${index}]`,
 
-        `(${index})`,
-
-        `(${lastName}, ${parsedData.year})`,
-
-        `(${lastName} ${parsedData.year})`,
-
-        `(${lastName})`
+        `(${index})`
 
     ]);
+
+
+    for (const authorForm of authorForms) {
+
+        candidates.add(`(${authorForm}, ${parsedData.year})`);
+        candidates.add(`(${authorForm} ${parsedData.year})`);
+        candidates.add(`(${authorForm})`);
+    }
 
 
     candidates.delete(newMarker);
@@ -291,10 +439,8 @@ function buildInlineMarker(
     index
 ) {
 
-    const lastName =
-        parsedData.author
-            .split(",")[0]
-            .trim();
+    const authorForm =
+        inTextAuthorForm(parsedData.author);
 
 
     switch (style) {
@@ -311,12 +457,12 @@ function buildInlineMarker(
 
         case "chicago":
 
-            return `(${lastName} ${parsedData.year})`;
+            return `(${authorForm} ${parsedData.year})`;
 
 
         case "mla":
 
-            return `(${lastName})`;
+            return `(${authorForm})`;
 
 
         case "apa":
@@ -325,7 +471,7 @@ function buildInlineMarker(
 
         default:
 
-            return `(${lastName}, ${parsedData.year})`;
+            return `(${authorForm}, ${parsedData.year})`;
     }
 }
 
@@ -457,13 +603,15 @@ const KNOWN_STYLE_PATTERNS = [
 
 function parseCitationText(text) {
 
+    const clean = sanitizeText(text);
+
     for (
         const { regex, map }
         of KNOWN_STYLE_PATTERNS
     ) {
 
         const match =
-            text.match(regex);
+            clean.match(regex);
 
 
         if (match) {
@@ -491,7 +639,7 @@ function parseCitationText(text) {
     }
 
 
-    return parseRawCitationText(text);
+    return parseRawCitationText(clean);
 }
 
 
@@ -534,9 +682,18 @@ function parseRawCitationText(text) {
         "Author, A.";
 
 
+    // Matches one or more "Lastname, F." / "Lastname, F. M." groups,
+    // separated by commas, "&", or "and" (e.g. "Brown, T., Wilson, A., & Khan, S.")
+    // Matches one or more "Lastname, F." author groups, joined by any of:
+    // ", & " (Oxford-comma + ampersand before the last author), a bare
+    // "," or "&", or the word "and". The ",\s*&\s*" branch MUST come
+    // before the plain ",\s*" branch, or the regex consumes only the
+    // comma and stops at "&" (which doesn't match the next author's
+    // required leading capital letter), silently dropping every author
+    // after the first "&".
     const authorMatch =
         cleanText.match(
-            /^([A-Z][a-z]+(?:,\s*[A-Z]\.|\s+[A-Z]\.)*(?:\s*,?\s*and\s+|\s*,?\s*&\s*)?)+/
+            /^([A-Z][a-zA-Z'-]+,\s*[A-Z]\.(?:\s*[A-Z]\.)?\s*(?:,\s*&\s*|,\s*|&\s*|\s+and\s+)?)+/
         );
 
 
